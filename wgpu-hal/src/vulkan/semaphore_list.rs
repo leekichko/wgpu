@@ -230,3 +230,142 @@ pub enum SemaphoreType {
     Binary(vk::Semaphore),
     Timeline(vk::Semaphore, u64),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ash::vk::Handle as _;
+
+    fn semaphore(raw: u64) -> vk::Semaphore {
+        vk::Semaphore::from_raw(raw)
+    }
+
+    /// The timeline info chained to `info`, if any.
+    fn timeline_info<'a>(
+        info: &vk::SubmitInfo<'a>,
+    ) -> Option<&'a vk::TimelineSemaphoreSubmitInfo<'a>> {
+        // SAFETY: `add_to_submit` chains at most one struct, a `VkTimelineSemaphoreSubmitInfo`
+        // that outlives `info`.
+        unsafe {
+            info.p_next
+                .cast::<vk::TimelineSemaphoreSubmitInfo<'a>>()
+                .as_ref()
+        }
+    }
+
+    #[test]
+    fn binary_waits_get_values_when_a_timeline_semaphore_is_signaled() {
+        // The shape of every `Queue::submit` after the first: a binary relay semaphore to wait
+        // on, and the timeline fence to signal.
+        let mut wait = SemaphoreList::new(SemaphoreListMode::Wait);
+        wait.push_wait(
+            SemaphoreType::Binary(semaphore(1)),
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+        );
+        let mut signal = SemaphoreList::new(SemaphoreListMode::Signal);
+        signal.push_signal(SemaphoreType::Binary(semaphore(2)));
+        signal.push_signal(SemaphoreType::Timeline(semaphore(3), 7));
+
+        let mut timeline = MaybeUninit::uninit();
+        let info = SemaphoreList::add_to_submit(
+            &mut wait,
+            &mut signal,
+            vk::SubmitInfo::default(),
+            &mut timeline,
+            true,
+        );
+
+        assert_eq!(info.wait_semaphore_count, 1);
+        let Some(timeline) = timeline_info(&info) else {
+            panic!("a timeline signal chains a VkTimelineSemaphoreSubmitInfo");
+        };
+        assert_eq!(
+            timeline.wait_semaphore_value_count,
+            info.wait_semaphore_count
+        );
+        assert!(!timeline.p_wait_semaphore_values.is_null());
+        assert_eq!(
+            timeline.signal_semaphore_value_count,
+            info.signal_semaphore_count
+        );
+        // SAFETY: the count says there are two values.
+        let signal_values =
+            unsafe { core::slice::from_raw_parts(timeline.p_signal_semaphore_values, 2) };
+        assert_eq!(signal_values[1], 7);
+    }
+
+    #[test]
+    fn binary_signals_get_values_when_a_timeline_semaphore_is_waited_on() {
+        let mut wait = SemaphoreList::new(SemaphoreListMode::Wait);
+        wait.push_wait(
+            SemaphoreType::Timeline(semaphore(1), 5),
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+        );
+        let mut signal = SemaphoreList::new(SemaphoreListMode::Signal);
+        signal.push_signal(SemaphoreType::Binary(semaphore(2)));
+
+        let mut timeline = MaybeUninit::uninit();
+        let info = SemaphoreList::add_to_submit(
+            &mut wait,
+            &mut signal,
+            vk::SubmitInfo::default(),
+            &mut timeline,
+            true,
+        );
+
+        let Some(timeline) = timeline_info(&info) else {
+            panic!("a timeline wait chains a VkTimelineSemaphoreSubmitInfo");
+        };
+        assert_eq!(timeline.wait_semaphore_value_count, 1);
+        assert_eq!(timeline.signal_semaphore_value_count, 1);
+    }
+
+    #[test]
+    fn without_the_workaround_binary_waits_get_no_values() {
+        // Valid Vulkan, and what every driver but Imagination's gets.
+        let mut wait = SemaphoreList::new(SemaphoreListMode::Wait);
+        wait.push_wait(
+            SemaphoreType::Binary(semaphore(1)),
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+        );
+        let mut signal = SemaphoreList::new(SemaphoreListMode::Signal);
+        signal.push_signal(SemaphoreType::Timeline(semaphore(2), 7));
+
+        let mut timeline = MaybeUninit::uninit();
+        let info = SemaphoreList::add_to_submit(
+            &mut wait,
+            &mut signal,
+            vk::SubmitInfo::default(),
+            &mut timeline,
+            false,
+        );
+
+        let Some(timeline) = timeline_info(&info) else {
+            panic!("a timeline signal chains a VkTimelineSemaphoreSubmitInfo");
+        };
+        assert_eq!(timeline.wait_semaphore_value_count, 0);
+        assert_eq!(timeline.signal_semaphore_value_count, 1);
+    }
+
+    #[test]
+    fn binary_semaphores_alone_chain_no_timeline_info() {
+        let mut wait = SemaphoreList::new(SemaphoreListMode::Wait);
+        wait.push_wait(
+            SemaphoreType::Binary(semaphore(1)),
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+        );
+        let mut signal = SemaphoreList::new(SemaphoreListMode::Signal);
+        signal.push_signal(SemaphoreType::Binary(semaphore(2)));
+
+        let mut timeline = MaybeUninit::uninit();
+        let info = SemaphoreList::add_to_submit(
+            &mut wait,
+            &mut signal,
+            vk::SubmitInfo::default(),
+            &mut timeline,
+            true,
+        );
+
+        assert!(info.p_next.is_null());
+    }
+}
